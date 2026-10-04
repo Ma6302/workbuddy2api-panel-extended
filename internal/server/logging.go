@@ -344,6 +344,8 @@ type requestTraceKey struct{}
 type requestTrace struct {
 	id    string
 	start time.Time
+	// path 归档用的真实入站路径；由 ServeHTTP 入口写入，event() 不再写死。
+	path  string
 	stat  *chatStat
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
 	clientIP  string
@@ -397,10 +399,14 @@ func requestTraceFrom(r *http.Request) *requestTrace {
 }
 
 func (t *requestTrace) event(status int) reqlog.Event {
+	path := t.path
+	if path == "" {
+		path = "/v1/chat/completions" // 兜底：未设 path 的调用点维持原行为
+	}
 	e := reqlog.Event{
 		Time:      t.start,
 		RequestID: t.id,
-		Path:      "/v1/chat/completions",
+		Path:      path,
 		Status:    status,
 	}
 	duration := time.Since(t.start)

@@ -1,0 +1,2849 @@
+diff -ruN --strip-trailing-cr /root/build/up-clean/Dockerfile.local /root/build/wb2api-1.11.11/Dockerfile.local
+--- /root/build/up-clean/Dockerfile.local	1970-01-01 08:00:00.000000000 +0800
++++ /root/build/wb2api-1.11.11/Dockerfile.local	2026-10-04 12:33:15.534171291 +0800
+@@ -0,0 +1,34 @@
++# syntax=docker/dockerfile:1
++# 本地构建：上游 v1.11.11 + 移植的 Anthropic Messages / Responses 入站（PR #63）
++FROM golang:1.23-alpine AS build
++ENV GOPROXY=https://goproxy.cn,direct \
++    GOFLAGS=-mod=mod \
++    CGO_ENABLED=0
++WORKDIR /src
++COPY go.mod go.sum ./
++RUN go mod download
++COPY . .
++RUN go build -trimpath -ldflags="-s -w" -o /out/wb2api ./cmd/server \
++ && go build -trimpath -ldflags="-s -w" -o /out/signin_bin ./cmd/signin \
++ && go build -trimpath -ldflags="-s -w" -o /out/login ./cmd/login \
++ && go build -trimpath -ldflags="-s -w" -o /out/credit ./cmd/credit
++
++FROM alpine:3.20
++RUN apk add --no-cache wget ca-certificates tzdata python3 bash \
++ && adduser -D -u 10001 app \
++ && mkdir -p /app/auths /app/data \
++ && chown -R app:app /app
++WORKDIR /app
++COPY --from=build /out/wb2api /app/wb2api
++COPY --from=build /out/signin_bin /app/signin_bin
++COPY --from=build /out/login /app/login
++COPY --from=build /out/credit /app/credit
++COPY login.sh signin.sh credit.sh /app/
++COPY scripts/probe_active.py /app/scripts/probe_active.py
++RUN sed -i 's/\r$//' /app/login.sh /app/signin.sh /app/credit.sh && chmod 755 /app/login.sh /app/signin.sh /app/credit.sh
++COPY config.example.json /app/config.json
++USER app
++EXPOSE 7863
++HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \
++  CMD wget -qO- http://127.0.0.1:7863/healthz || exit 1
++ENTRYPOINT ["/app/wb2api", "-config", "/app/config.json"]
+diff -ruN --strip-trailing-cr /root/build/up-clean/go.mod /root/build/wb2api-1.11.11/go.mod
+--- /root/build/up-clean/go.mod	2026-10-01 21:16:23.000000000 +0800
++++ /root/build/wb2api-1.11.11/go.mod	2026-10-04 12:24:40.697743980 +0800
+@@ -2,10 +2,11 @@
+ 
+ go 1.22.5
+ 
++require github.com/redis/go-redis/v9 v9.18.0
++
+ require (
+ 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+ 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
+-	github.com/redis/go-redis/v9 v9.18.0 // indirect
+ 	go.uber.org/atomic v1.11.0 // indirect
+ 	golang.org/x/sys v0.30.0 // indirect
+ )
+diff -ruN --strip-trailing-cr /root/build/up-clean/internal/server/handler.go /root/build/wb2api-1.11.11/internal/server/handler.go
+--- /root/build/up-clean/internal/server/handler.go	2026-10-01 21:16:23.000000000 +0800
++++ /root/build/wb2api-1.11.11/internal/server/handler.go	2026-10-04 12:44:41.205316051 +0800
+@@ -133,6 +133,9 @@
+ 	}
+ 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+ 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
++	h.mux.HandleFunc("POST /v1/messages", h.withAnthropicAuth(h.messages))
++	h.mux.HandleFunc("POST /messages", h.withAnthropicAuth(h.messages))
++	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
+ 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
+ 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
+ 	h.mux.HandleFunc("GET /healthz", h.healthz)
+@@ -142,9 +145,20 @@
+ 	return h
+ }
+ 
++// loggedChatPath 判断入站路径是否走请求归档。三种入站协议
++// （chat_completions / anthropic_messages / codex_responses）共用同一条 chat 管线与统计，
++// 归档不应只覆盖 /v1/chat/completions，否则 /v1/messages 的流量在面板运行日志里整片消失。
++func loggedChatPath(p string) bool {
++	switch p {
++	case "/v1/chat/completions", "/v1/messages", "/messages", "/v1/responses":
++		return true
++	}
++	return false
++}
++
+ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+-	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions" {
+-		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now()}
++	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && loggedChatPath(r.URL.Path) {
++		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now(), path: r.URL.Path}
+ 		if h.loadLive().RecordClientInfo {
+ 			trace.captureClientInfo(r)
+ 		}
+diff -ruN --strip-trailing-cr /root/build/up-clean/internal/server/logging.go /root/build/wb2api-1.11.11/internal/server/logging.go
+--- /root/build/up-clean/internal/server/logging.go	2026-10-01 21:16:23.000000000 +0800
++++ /root/build/wb2api-1.11.11/internal/server/logging.go	2026-10-04 12:44:41.205316051 +0800
+@@ -344,6 +344,8 @@
+ type requestTrace struct {
+ 	id    string
+ 	start time.Time
++	// path 归档用的真实入站路径；由 ServeHTTP 入口写入，event() 不再写死。
++	path  string
+ 	stat  *chatStat
+ 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
+ 	clientIP  string
+@@ -397,10 +399,14 @@
+ }
+ 
+ func (t *requestTrace) event(status int) reqlog.Event {
++	path := t.path
++	if path == "" {
++		path = "/v1/chat/completions" // 兜底：未设 path 的调用点维持原行为
++	}
+ 	e := reqlog.Event{
+ 		Time:      t.start,
+ 		RequestID: t.id,
+-		Path:      "/v1/chat/completions",
++		Path:      path,
+ 		Status:    status,
+ 	}
+ 	duration := time.Since(t.start)
+diff -ruN --strip-trailing-cr /root/build/up-clean/internal/server/messages.go /root/build/wb2api-1.11.11/internal/server/messages.go
+--- /root/build/up-clean/internal/server/messages.go	1970-01-01 08:00:00.000000000 +0800
++++ /root/build/wb2api-1.11.11/internal/server/messages.go	2026-10-04 12:17:10.204367041 +0800
+@@ -0,0 +1,952 @@
++// messages.go Anthropic Messages 入站：POST /v1/messages 与 /messages ↔ 现有 chatCompletions。
++// ponytail: 不存会话；客户端每轮带全量 messages。thinking 无 signature，不回传。
++// top_k / cache_control / context_management / betas / count_tokens 上游 chat 没有对应物，丢掉。
++// 内置服务端工具（web_search / code_execution / bash_* …）没有本地执行器，丢掉并在 system 里写明。
++package server
++
++import (
++	"bytes"
++	"encoding/json"
++	"io"
++	"net/http"
++	"strings"
++
++	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
++)
++
++func (h *Handler) withAnthropicAuth(next http.HandlerFunc) http.HandlerFunc {
++	return func(w http.ResponseWriter, r *http.Request) {
++		// 官方 SDK 用 x-api-key，不是 Bearer。空 Authorization 时提升，再走同一套比较。
++		if r.Header.Get("Authorization") == "" {
++			if k := r.Header.Get("x-api-key"); k != "" {
++				r.Header.Set("Authorization", "Bearer "+k)
++			}
++		}
++		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
++			writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "missing or invalid API key")
++			return
++		}
++		next(w, r)
++	}
++}
++
++func (h *Handler) messages(w http.ResponseWriter, r *http.Request) {
++	body, err := io.ReadAll(r.Body)
++	if err != nil {
++		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "read body: "+err.Error())
++		return
++	}
++	chat, err := messagesToChat(body)
++	if err != nil {
++		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
++		return
++	}
++	var peek struct {
++		Stream bool `json:"stream"`
++	}
++	_ = json.Unmarshal(chat, &peek)
++	r2 := r.Clone(r.Context())
++	r2.Body = io.NopCloser(bytes.NewReader(chat))
++	r2.ContentLength = int64(len(chat))
++	rw := &messagesWriter{ResponseWriter: w, stream: peek.Stream}
++	defer rw.finish()
++	h.chatCompletions(rw, r2)
++}
++
++func writeAnthropicError(w http.ResponseWriter, status int, typ, msg string) {
++	writeJSON(w, status, map[string]any{
++		"type":  "error",
++		"error": map[string]any{"type": typ, "message": msg},
++	})
++}
++
++func messagesToChat(src []byte) ([]byte, error) {
++	var obj map[string]any
++	if err := json.Unmarshal(src, &obj); err != nil {
++		return nil, err
++	}
++	out := map[string]any{}
++	for _, k := range []string{"model", "stream", "temperature", "top_p", "max_tokens"} {
++		if v, ok := obj[k]; ok {
++			out[k] = v
++		}
++	}
++	if v, ok := obj["stop_sequences"]; ok {
++		out["stop"] = v
++	}
++	if md, ok := obj["metadata"].(map[string]any); ok {
++		if u, ok := md["user_id"]; ok {
++			out["user"] = u
++		}
++	}
++	switch tc := obj["tool_choice"].(type) {
++	case string:
++		out["tool_choice"] = tc
++	case map[string]any:
++		if c, ok := mapAnthropicToolChoice(tc); ok {
++			out["tool_choice"] = c
++		}
++		if dis, ok := tc["disable_parallel_tool_use"].(bool); ok && dis {
++			out["parallel_tool_calls"] = false
++		}
++	}
++	var tools []any
++	var skipped []string
++	if raw, ok := obj["tools"].([]any); ok {
++		tools, skipped = anthropicTools(raw)
++		if len(tools) > 0 {
++			out["tools"] = tools
++		}
++	}
++	if e := effortFromMessages(obj); e != "" {
++		out["reasoning_effort"] = e
++	}
++	msgs := []any{}
++	if sys := systemText(obj["system"]); sys != "" {
++		msgs = append(msgs, map[string]any{"role": "system", "content": sys})
++	}
++	if note := skippedToolsNote(skipped); note != "" {
++		msgs = append(msgs, map[string]any{"role": "system", "content": note})
++	}
++	if in, ok := obj["messages"].([]any); ok {
++		msgs = append(msgs, convertAnthropicMessages(in)...)
++	}
++	out["messages"] = msgs
++	return json.Marshal(out)
++}
++
++// effortFromMessages 把 Messages 的思考档收成上游已有的 reasoning_effort。
++// output_config.effort 优先；旧式 budget_tokens 按 Hermes 的档位表折回。
++// adaptive / enabled 没带档位时不发明档位，交给上游默认。disabled 显式 none。
++func effortFromMessages(obj map[string]any) string {
++	if oc, ok := obj["output_config"].(map[string]any); ok {
++		if e := asString(oc["effort"]); e != "" {
++			return e
++		}
++	}
++	th, _ := obj["thinking"].(map[string]any)
++	if th == nil {
++		return ""
++	}
++	switch strings.ToLower(asString(th["type"])) {
++	case "disabled":
++		return "none"
++	case "enabled":
++		n, ok := th["budget_tokens"].(float64)
++		if !ok || n <= 0 {
++			return ""
++		}
++		switch {
++		case n >= 32000:
++			return "xhigh"
++		case n >= 16000:
++			return "high"
++		case n >= 8000:
++			return "medium"
++		default:
++			return "low"
++		}
++	default:
++		return ""
++	}
++}
++
++func skippedToolsNote(names []string) string {
++	if len(names) == 0 {
++		return ""
++	}
++	return "These Anthropic server tools are not available here: " + strings.Join(names, ", ") + ". Do not call them."
++}
++
++func systemText(v any) string {
++	switch t := v.(type) {
++	case string:
++		return t
++	case []any:
++		var b strings.Builder
++		for i, p := range t {
++			m, ok := p.(map[string]any)
++			if !ok {
++				continue
++			}
++			text := asString(m["text"])
++			if text == "" {
++				continue
++			}
++			if i > 0 && b.Len() > 0 {
++				b.WriteByte('\n')
++			}
++			b.WriteString(text)
++		}
++		return b.String()
++	default:
++		return ""
++	}
++}
++
++func mapAnthropicToolChoice(m map[string]any) (any, bool) {
++	switch asString(m["type"]) {
++	case "auto":
++		return "auto", true
++	case "any":
++		return "required", true
++	case "none":
++		return "none", true
++	case "tool":
++		return map[string]any{"type": "function", "function": map[string]any{"name": asString(m["name"])}}, true
++	default:
++		return nil, false
++	}
++}
++
++// anthropicTools 只保留客户端自己执行的工具。
++// 带 input_schema 的（含 type=custom / 缺 type）原样变成 function。
++// 没有 schema 的内置服务端工具没有本地执行器，返回名字供 system 说明，不发给上游。
++func anthropicTools(tools []any) (out []any, skipped []string) {
++	out = make([]any, 0, len(tools))
++	for _, t := range tools {
++		m, ok := t.(map[string]any)
++		if !ok {
++			continue
++		}
++		if _, ok := m["function"].(map[string]any); ok {
++			out = append(out, m)
++			continue
++		}
++		if _, ok := m["input_schema"]; !ok {
++			if n := toolLabel(m); n != "" {
++				skipped = append(skipped, n)
++			}
++			continue
++		}
++		fn := map[string]any{"name": asString(m["name"])}
++		if d, ok := m["description"]; ok {
++			fn["description"] = d
++		}
++		fn["parameters"] = m["input_schema"]
++		out = append(out, map[string]any{"type": "function", "function": fn})
++	}
++	return out, skipped
++}
++
++func toolLabel(m map[string]any) string {
++	if n := asString(m["name"]); n != "" {
++		return n
++	}
++	return asString(m["type"])
++}
++
++func convertAnthropicMessages(in []any) []any {
++	var out []any
++	for _, it := range in {
++		m, ok := it.(map[string]any)
++		if !ok {
++			continue
++		}
++		role := asString(m["role"])
++		if role == "" {
++			role = "user"
++		}
++		switch c := m["content"].(type) {
++		case string:
++			out = append(out, map[string]any{"role": role, "content": c})
++		case []any:
++			out = append(out, blocksToMessages(role, c)...)
++		default:
++			if s := asString(m["content"]); s != "" {
++				out = append(out, map[string]any{"role": role, "content": s})
++			}
++		}
++	}
++	return out
++}
++
++func blocksToMessages(role string, blocks []any) []any {
++	var toolCalls, toolMsgs, parts []any
++	var texts []string
++	hasNonText := false
++	for _, b := range blocks {
++		m, ok := b.(map[string]any)
++		if !ok {
++			continue
++		}
++		switch asString(m["type"]) {
++		case "thinking", "redacted_thinking":
++			continue
++		case "tool_use", "server_tool_use":
++			toolCalls = append(toolCalls, map[string]any{
++				"id":   asString(m["id"]),
++				"type": "function",
++				"function": map[string]any{
++					"name":      asString(m["name"]),
++					"arguments": mustJSON(m["input"]),
++				},
++			})
++		case "tool_result":
++			toolMsgs = append(toolMsgs, map[string]any{
++				"role":         "tool",
++				"tool_call_id": asString(m["tool_use_id"]),
++				"content":      toolResultContent(m["content"], m["is_error"]),
++			})
++		case "image":
++			hasNonText = true
++			parts = append(parts, imagePart(m))
++		case "document":
++			hasNonText = true
++			parts = append(parts, map[string]any{"type": "text", "text": documentText(m)})
++		default:
++			t := blockText(m)
++			texts = append(texts, t)
++			parts = append(parts, map[string]any{"type": "text", "text": t})
++		}
++	}
++	out := append([]any{}, toolMsgs...)
++	if len(toolCalls) == 0 && len(texts) == 0 && !hasNonText {
++		return out
++	}
++	msg := map[string]any{"role": role}
++	if len(toolCalls) > 0 {
++		msg["tool_calls"] = toolCalls
++	}
++	if hasNonText {
++		msg["content"] = parts
++	} else if len(texts) > 0 {
++		msg["content"] = strings.Join(texts, "")
++	} else {
++		msg["content"] = ""
++	}
++	return append(out, msg)
++}
++
++func imagePart(m map[string]any) map[string]any {
++	url := ""
++	if src, ok := m["source"].(map[string]any); ok {
++		switch asString(src["type"]) {
++		case "base64":
++			url = "data:" + asString(src["media_type"]) + ";base64," + asString(src["data"])
++		default:
++			url = asString(src["url"])
++		}
++	}
++	return map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}}
++}
++
++func blockText(m map[string]any) string {
++	if t := asString(m["text"]); t != "" || m["text"] != nil {
++		return t
++	}
++	if t := asString(m["thinking"]); t != "" {
++		return t
++	}
++	if c, ok := m["content"]; ok {
++		return toolResultContent(c, nil)
++	}
++	return ""
++}
++
++func documentText(m map[string]any) string {
++	title := asString(m["title"])
++	src, _ := m["source"].(map[string]any)
++	var body string
++	if src != nil {
++		switch asString(src["type"]) {
++		case "text":
++			body = asString(src["data"])
++		case "content":
++			body = toolResultContent(src["content"], nil)
++		case "base64":
++			body = "[document " + asString(src["media_type"]) + " omitted]"
++		case "url":
++			body = asString(src["url"])
++		}
++	}
++	if title != "" {
++		return title + "\n" + body
++	}
++	return body
++}
++
++func toolResultContent(v any, isError any) string {
++	s := contentToString(v)
++	if b, ok := isError.(bool); ok && b {
++		return "error: " + s
++	}
++	return s
++}
++
++func contentToString(v any) string {
++	switch t := v.(type) {
++	case string:
++		return t
++	case []any:
++		var b strings.Builder
++		for _, p := range t {
++			m, ok := p.(map[string]any)
++			if !ok {
++				continue
++			}
++			switch asString(m["type"]) {
++			case "image":
++				img := imagePart(m)
++				if u, ok := img["image_url"].(map[string]any); ok {
++					b.WriteString(asString(u["url"]))
++				}
++			case "document":
++				b.WriteString(documentText(m))
++			default:
++				b.WriteString(blockText(m))
++			}
++		}
++		return b.String()
++	case map[string]any:
++		if _, ok := t["type"]; ok {
++			return blockText(t)
++		}
++		return mustJSON(t)
++	default:
++		return asString(v)
++	}
++}
++
++func mustJSON(v any) string {
++	if v == nil {
++		return "{}"
++	}
++	if s, ok := v.(string); ok {
++		return s
++	}
++	b, err := json.Marshal(v)
++	if err != nil {
++		return "{}"
++	}
++	return string(b)
++}
++
++func chatCompletionToMessage(obj map[string]any) map[string]any {
++	id, _ := obj["id"].(string)
++	model, _ := obj["model"].(string)
++	var msg map[string]any
++	fr := ""
++	if chs, ok := obj["choices"].([]any); ok && len(chs) > 0 {
++		if c, ok := chs[0].(map[string]any); ok {
++			msg, _ = c["message"].(map[string]any)
++			fr, _ = c["finish_reason"].(string)
++		}
++	}
++	content := []any{}
++	if msg != nil {
++		// ponytail: reasoning_content 没有 signature，回传 thinking 会让下一轮 400。
++		if text := messageText(msg["content"]); text != "" {
++			content = append(content, map[string]any{"type": "text", "text": text})
++		}
++		if tcs, ok := msg["tool_calls"].([]any); ok {
++			for _, tci := range tcs {
++				tc, _ := tci.(map[string]any)
++				if tc == nil {
++					continue
++				}
++				fn, _ := tc["function"].(map[string]any)
++				name, args := "", any(nil)
++				if fn != nil {
++					name = asString(fn["name"])
++					args = fn["arguments"]
++				}
++				content = append(content, map[string]any{
++					"type":  "tool_use",
++					"id":    asString(tc["id"]),
++					"name":  name,
++					"input": parseToolInput(args),
++				})
++			}
++		}
++	}
++	return map[string]any{
++		"id":            msgID(id),
++		"type":          "message",
++		"role":          "assistant",
++		"model":         model,
++		"content":       content,
++		"stop_reason":   anthropicStop(fr),
++		"stop_sequence": nil,
++		"usage":         anthropicUsage(obj["usage"]),
++	}
++}
++
++func messageText(v any) string {
++	if s, ok := v.(string); ok {
++		return s
++	}
++	return asContentString(v)
++}
++
++func parseToolInput(v any) any {
++	switch t := v.(type) {
++	case nil:
++		return map[string]any{}
++	case map[string]any:
++		return t
++	case string:
++		if t == "" {
++			return map[string]any{}
++		}
++		var parsed any
++		if json.Unmarshal([]byte(t), &parsed) != nil || parsed == nil {
++			return map[string]any{"raw": t}
++		}
++		if _, ok := parsed.(map[string]any); ok {
++			return parsed
++		}
++		return map[string]any{"value": parsed}
++	default:
++		return map[string]any{"value": t}
++	}
++}
++
++func anthropicStop(fr string) string {
++	switch fr {
++	case "length":
++		return "max_tokens"
++	case "tool_calls", "function_call":
++		return "tool_use"
++	default:
++		return "end_turn"
++	}
++}
++
++func anthropicUsage(v any) map[string]any {
++	out := map[string]any{"input_tokens": 0, "output_tokens": 0}
++	u, _ := v.(map[string]any)
++	if u == nil {
++		return out
++	}
++	if n, ok := u["prompt_tokens"]; ok {
++		out["input_tokens"] = n
++	}
++	if n, ok := u["completion_tokens"]; ok {
++		out["output_tokens"] = n
++	}
++	// ponytail: 上游的 cache_read_/cache_creation_input_tokens 恒 0，真实命中数在
++	// prompt_cache_hit_tokens（prompt_tokens_details.cached_tokens 同值）。不映射
++	// 的话 Claude 系客户端一律显示缓存读取 0。
++	if n, ok := u["prompt_cache_hit_tokens"]; ok {
++		out["cache_read_input_tokens"] = n
++	}
++	if n, ok := u["prompt_cache_write_tokens"]; ok {
++		out["cache_creation_input_tokens"] = n
++	}
++	return out
++}
++
++func msgID(id string) string {
++	if id == "" {
++		id = "wb2api"
++	}
++	if strings.HasPrefix(id, "msg_") {
++		return id
++	}
++	return "msg_" + id
++}
++
++func anthropicErrType(status int) string {
++	switch status {
++	case http.StatusBadRequest, http.StatusUnprocessableEntity:
++		return "invalid_request_error"
++	case http.StatusUnauthorized:
++		return "authentication_error"
++	case http.StatusForbidden:
++		return "permission_error"
++	case http.StatusNotFound:
++		return "not_found_error"
++	case http.StatusTooManyRequests:
++		return "rate_limit_error"
++	case http.StatusServiceUnavailable, 529:
++		return "overloaded_error"
++	default:
++		return "api_error"
++	}
++}
++
++func anthropicErrorBody(status int, obj map[string]any) []byte {
++	msg := "upstream error"
++	if e, ok := obj["error"].(map[string]any); ok {
++		if m := asString(e["message"]); m != "" {
++			msg = m
++		}
++	}
++	raw, _ := json.Marshal(map[string]any{
++		"type":  "error",
++		"error": map[string]any{"type": anthropicErrType(status), "message": msg},
++	})
++	return raw
++}
++
++type messagesWriter struct {
++	http.ResponseWriter
++	stream  bool
++	status  int
++	hdrSent bool
++	rest    []byte
++	body    []byte
++	x       anthState
++}
++
++type anthState struct {
++	started, failed, done bool
++	id, model, stop       string
++	textOpen              bool
++	textIdx, next         int
++	tools                 map[int]*anthTool
++	toolOrder             []int
++	usage                 map[string]any
++}
++
++type anthTool struct {
++	idx            int
++	block          int
++	id, name       string
++	opened, closed bool
++}
++
++func (w *messagesWriter) Header() http.Header { return w.ResponseWriter.Header() }
++
++func (w *messagesWriter) WriteHeader(code int) { w.status = code }
++
++func (w *messagesWriter) Flush() {
++	if f, ok := w.ResponseWriter.(http.Flusher); ok {
++		f.Flush()
++	}
++}
++
++func (w *messagesWriter) Write(p []byte) (int, error) {
++	if w.stream && strings.Contains(w.Header().Get("Content-Type"), "event-stream") {
++		w.rest = append(w.rest, p...)
++		for {
++			i := bytes.Index(w.rest, []byte("\n\n"))
++			if i < 0 {
++				break
++			}
++			frame := string(bytes.TrimSpace(w.rest[:i]))
++			w.rest = w.rest[i+2:]
++			if err := w.handleFrame(frame); err != nil {
++				return len(p), err
++			}
++		}
++		return len(p), nil
++	}
++	w.body = append(w.body, p...)
++	return len(p), nil
++}
++
++func (w *messagesWriter) finish() {
++	if w.stream {
++		if strings.Contains(w.Header().Get("Content-Type"), "event-stream") || w.hdrSent {
++			if w.x.started && !w.x.done && !w.x.failed {
++				_ = w.closeAndStop()
++			}
++			return
++		}
++		_ = w.emitJSONError()
++		return
++	}
++	w.flushJSON()
++}
++
++func (w *messagesWriter) flushJSON() {
++	status := w.status
++	if status == 0 {
++		status = http.StatusOK
++	}
++	w.Header().Set("Content-Type", "application/json")
++	if len(w.body) == 0 {
++		w.ResponseWriter.WriteHeader(status)
++		return
++	}
++	var obj map[string]any
++	if json.Unmarshal(w.body, &obj) != nil {
++		w.ResponseWriter.WriteHeader(status)
++		_, _ = w.ResponseWriter.Write(w.body)
++		return
++	}
++	if _, ok := obj["error"]; ok {
++		w.ResponseWriter.WriteHeader(status)
++		_, _ = w.ResponseWriter.Write(anthropicErrorBody(status, obj))
++		return
++	}
++	raw, err := json.Marshal(chatCompletionToMessage(obj))
++	if err != nil {
++		w.ResponseWriter.WriteHeader(status)
++		_, _ = w.ResponseWriter.Write(w.body)
++		return
++	}
++	w.ResponseWriter.WriteHeader(status)
++	_, _ = w.ResponseWriter.Write(raw)
++}
++
++func (w *messagesWriter) emitJSONError() error {
++	var obj map[string]any
++	_ = json.Unmarshal(w.body, &obj)
++	msg := "upstream error"
++	if e, ok := obj["error"].(map[string]any); ok {
++		if m := asString(e["message"]); m != "" {
++			msg = m
++		}
++	}
++	status := w.status
++	if status == 0 {
++		status = http.StatusInternalServerError
++	}
++	return w.emitError(msg, anthropicErrType(status))
++}
++
++func (w *messagesWriter) handleFrame(frame string) error {
++	if w.x.failed || w.x.done {
++		return nil
++	}
++	if strings.HasPrefix(frame, "data: [DONE]") {
++		return w.closeAndStop()
++	}
++	payload, ok := strings.CutPrefix(frame, "data: ")
++	if !ok {
++		return nil
++	}
++	var obj map[string]any
++	if json.Unmarshal([]byte(payload), &obj) != nil {
++		return nil
++	}
++	if errObj, ok := obj["error"]; ok {
++		msg := "upstream error"
++		if e, ok := errObj.(map[string]any); ok {
++			if m := asString(e["message"]); m != "" {
++				msg = m
++			}
++		}
++		return w.emitError(msg, "api_error")
++	}
++	return w.handleChunk(obj)
++}
++
++func (w *messagesWriter) handleChunk(obj map[string]any) error {
++	if err := w.ensureStart(obj); err != nil {
++		return err
++	}
++	if u, ok := obj["usage"].(map[string]any); ok {
++		w.x.usage = u
++	}
++	chs, _ := obj["choices"].([]any)
++	if len(chs) == 0 {
++		return nil
++	}
++	c, _ := chs[0].(map[string]any)
++	if c == nil {
++		return nil
++	}
++	if d, _ := c["delta"].(map[string]any); d != nil {
++		if s, ok := d["content"].(string); ok && s != "" {
++			if err := w.ensureText(); err != nil {
++				return err
++			}
++			if err := w.emit("content_block_delta", map[string]any{
++				"index": w.x.textIdx,
++				"delta": map[string]any{"type": "text_delta", "text": s},
++			}); err != nil {
++				return err
++			}
++		}
++		if tcs, ok := d["tool_calls"].([]any); ok {
++			if err := w.onTools(tcs); err != nil {
++				return err
++			}
++		}
++	}
++	if fr, ok := c["finish_reason"].(string); ok && fr != "" {
++		w.x.stop = fr
++	}
++	return nil
++}
++
++func (w *messagesWriter) ensureStart(obj map[string]any) error {
++	if w.x.started {
++		return nil
++	}
++	w.x.started = true
++	if obj != nil {
++		w.x.id, _ = obj["id"].(string)
++		w.x.model, _ = obj["model"].(string)
++	}
++	// ponytail: usage 在最后一帧才到，message_start 的 input_tokens 固定 0；真实数在 message_delta。
++	return w.emit("message_start", map[string]any{
++		"message": map[string]any{
++			"id":            msgID(w.x.id),
++			"type":          "message",
++			"role":          "assistant",
++			"content":       []any{},
++			"model":         w.x.model,
++			"stop_reason":   nil,
++			"stop_sequence": nil,
++			"usage":         map[string]any{"input_tokens": 0, "output_tokens": 0},
++		},
++	})
++}
++
++func (w *messagesWriter) ensureText() error {
++	if w.x.textOpen {
++		return nil
++	}
++	w.x.textIdx = w.x.next
++	w.x.next++
++	w.x.textOpen = true
++	return w.emit("content_block_start", map[string]any{
++		"index":         w.x.textIdx,
++		"content_block": map[string]any{"type": "text", "text": ""},
++	})
++}
++
++func (w *messagesWriter) onTools(tcs []any) error {
++	if w.x.tools == nil {
++		w.x.tools = map[int]*anthTool{}
++	}
++	for _, tci := range tcs {
++		tc, _ := tci.(map[string]any)
++		if tc == nil {
++			continue
++		}
++		idx := 0
++		if v, ok := tc["index"].(float64); ok {
++			idx = int(v)
++		}
++		acc, ok := w.x.tools[idx]
++		if !ok {
++			acc = &anthTool{idx: idx}
++			w.x.tools[idx] = acc
++			w.x.toolOrder = append(w.x.toolOrder, idx)
++		}
++		if id := asString(tc["id"]); id != "" {
++			acc.id = id
++		}
++		fn, _ := tc["function"].(map[string]any)
++		args := ""
++		if fn != nil {
++			if n := asString(fn["name"]); n != "" {
++				acc.name = n
++			}
++			args = asString(fn["arguments"])
++		}
++		if !acc.opened && (acc.id != "" || acc.name != "" || args != "") {
++			if err := w.openTool(acc); err != nil {
++				return err
++			}
++		}
++		if args != "" && acc.opened {
++			if err := w.emit("content_block_delta", map[string]any{
++				"index": acc.block,
++				"delta": map[string]any{"type": "input_json_delta", "partial_json": args},
++			}); err != nil {
++				return err
++			}
++		}
++	}
++	return nil
++}
++
++func (w *messagesWriter) openTool(acc *anthTool) error {
++	if acc.opened {
++		return nil
++	}
++	if w.x.textOpen {
++		if err := w.emit("content_block_stop", map[string]any{"index": w.x.textIdx}); err != nil {
++			return err
++		}
++		w.x.textOpen = false
++	}
++	acc.opened = true
++	acc.block = w.x.next
++	w.x.next++
++	if acc.id == "" {
++		acc.id = "toolu_" + asString(acc.idx)
++	}
++	return w.emit("content_block_start", map[string]any{
++		"index": acc.block,
++		"content_block": map[string]any{
++			"type":  "tool_use",
++			"id":    acc.id,
++			"name":  acc.name,
++			"input": map[string]any{},
++		},
++	})
++}
++
++func (w *messagesWriter) closeAndStop() error {
++	if w.x.done || w.x.failed {
++		return nil
++	}
++	w.x.done = true
++	if !w.x.started {
++		if err := w.ensureStart(nil); err != nil {
++			return err
++		}
++	}
++	if w.x.textOpen {
++		if err := w.emit("content_block_stop", map[string]any{"index": w.x.textIdx}); err != nil {
++			return err
++		}
++		w.x.textOpen = false
++	}
++	for _, idx := range w.x.toolOrder {
++		acc := w.x.tools[idx]
++		if !acc.opened {
++			if err := w.openTool(acc); err != nil {
++				return err
++			}
++		}
++		if !acc.closed {
++			if err := w.emit("content_block_stop", map[string]any{"index": acc.block}); err != nil {
++				return err
++			}
++			acc.closed = true
++		}
++	}
++	if err := w.emit("message_delta", map[string]any{
++		"delta": map[string]any{"stop_reason": anthropicStop(w.x.stop), "stop_sequence": nil},
++		"usage": anthropicUsage(w.x.usage),
++	}); err != nil {
++		return err
++	}
++	return w.emit("message_stop", map[string]any{})
++}
++
++func (w *messagesWriter) emitError(msg, typ string) error {
++	if w.x.failed || w.x.done {
++		return nil
++	}
++	w.x.failed = true
++	w.x.done = true
++	return w.emit("error", map[string]any{
++		"error": map[string]any{"type": typ, "message": msg},
++	})
++}
++
++func (w *messagesWriter) emit(event string, payload map[string]any) error {
++	if payload == nil {
++		payload = map[string]any{}
++	}
++	payload["type"] = event
++	raw, err := json.Marshal(payload)
++	if err != nil {
++		return err
++	}
++	if !w.hdrSent {
++		h := w.Header()
++		h.Set("Content-Type", "text/event-stream")
++		h.Set("Cache-Control", "no-cache")
++		h.Set("Connection", "keep-alive")
++		// ponytail: 不显式 WriteHeader——下面的 io.WriteString 会隐式提交 200
++		//（Flush 先提交时显式调用会变成 superfluous 警告，同 responses.go emit）。
++		w.hdrSent = true
++		w.status = http.StatusOK
++	}
++	if _, err := io.WriteString(w.ResponseWriter, "event: "+event+"\ndata: "+string(raw)+"\n\n"); err != nil {
++		return err
++	}
++	w.Flush()
++	return nil
++}
+diff -ruN --strip-trailing-cr /root/build/up-clean/internal/server/messages_test.go /root/build/wb2api-1.11.11/internal/server/messages_test.go
+--- /root/build/up-clean/internal/server/messages_test.go	1970-01-01 08:00:00.000000000 +0800
++++ /root/build/wb2api-1.11.11/internal/server/messages_test.go	2026-10-04 12:17:23.441818011 +0800
+@@ -0,0 +1,418 @@
++package server
++
++import (
++	"bytes"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
++	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
++	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
++)
++
++func TestMessagesToChat(t *testing.T) {
++	src := []byte(`{
++		"model":"glm-5.2",
++		"max_tokens":128,
++		"system":[{"type":"text","text":"sys-a","cache_control":{"type":"ephemeral"}},{"type":"text","text":"sys-b"}],
++		"messages":[
++			{"role":"user","content":[
++				{"type":"text","text":"look"},
++				{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aaa"}}
++			]},
++			{"role":"assistant","content":[
++				{"type":"thinking","thinking":"secret","signature":"sig"},
++				{"type":"text","text":"ok"},
++				{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"cmd":"ls"}}
++			]},
++			{"role":"user","content":[
++				{"type":"tool_result","tool_use_id":"toolu_1","content":"a.txt"},
++				{"type":"text","text":"next"}
++			]}
++		],
++		"tools":[{"name":"Bash","description":"run","input_schema":{"type":"object"}}],
++		"tool_choice":{"type":"tool","name":"Bash","disable_parallel_tool_use":true},
++		"stop_sequences":["END"],
++		"top_k":5,
++		"metadata":{"user_id":"u"},
++		"thinking":{"type":"adaptive","display":"summarized"},
++		"output_config":{"effort":"high","format":{"type":"json_schema","schema":{"type":"object"}}},
++		"context_management":{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}
++		}`)
++	got, err := messagesToChat(src)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var obj map[string]any
++	if err := json.Unmarshal(got, &obj); err != nil {
++		t.Fatal(err)
++	}
++	if _, ok := obj["top_k"]; ok {
++		t.Fatal("top_k must be dropped")
++	}
++	if obj["max_tokens"] != float64(128) || obj["user"] != "u" {
++		t.Fatalf("scalars=%v", obj)
++	}
++	stops, _ := obj["stop"].([]any)
++	if len(stops) != 1 || stops[0] != "END" {
++		t.Fatalf("stop=%v", obj["stop"])
++	}
++	if obj["parallel_tool_calls"] != false {
++		t.Fatalf("parallel=%v", obj["parallel_tool_calls"])
++	}
++	choice := obj["tool_choice"].(map[string]any)
++	fn := choice["function"].(map[string]any)
++	if fn["name"] != "Bash" {
++		t.Fatalf("tool_choice=%v", choice)
++	}
++	if tools := obj["tools"].([]any); len(tools) != 1 {
++		t.Fatalf("tools=%v", tools)
++	}
++	if obj["reasoning_effort"] != "high" {
++		t.Fatalf("effort=%v", obj["reasoning_effort"])
++	}
++	if _, ok := obj["thinking"]; ok {
++		t.Fatal("thinking must not be forwarded")
++	}
++	if _, ok := obj["output_config"]; ok {
++		t.Fatal("output_config must not be forwarded")
++	}
++	if _, ok := obj["context_management"]; ok {
++		t.Fatal("context_management must not be forwarded")
++	}
++	msgs := obj["messages"].([]any)
++	if len(msgs) != 5 {
++		t.Fatalf("len=%d %#v", len(msgs), msgs)
++	}
++	if msgs[0].(map[string]any)["content"] != "sys-a\nsys-b" {
++		t.Fatalf("system=%v", msgs[0])
++	}
++	user := msgs[1].(map[string]any)
++	parts := user["content"].([]any)
++	img := parts[1].(map[string]any)["image_url"].(map[string]any)["url"]
++	if img != "data:image/png;base64,aaa" {
++		t.Fatalf("image=%v", img)
++	}
++	asst := msgs[2].(map[string]any)
++	if strings.Contains(mustJSON(asst), "secret") || strings.Contains(mustJSON(asst), "signature") {
++		t.Fatalf("thinking leaked: %v", asst)
++	}
++	tc := asst["tool_calls"].([]any)[0].(map[string]any)
++	if tc["id"] != "toolu_1" || tc["function"].(map[string]any)["arguments"] != `{"cmd":"ls"}` {
++		t.Fatalf("tool_call=%v", tc)
++	}
++	tool := msgs[3].(map[string]any)
++	if tool["role"] != "tool" || tool["tool_call_id"] != "toolu_1" || tool["content"] != "a.txt" {
++		t.Fatalf("tool=%v", tool)
++	}
++	if msgs[4].(map[string]any)["content"] != "next" {
++		t.Fatalf("next=%v", msgs[4])
++	}
++}
++
++func TestMessagesClientShapes(t *testing.T) {
++	// Claude Code 实测顶层字段 + SDK 内置工具 + 文档块。模型名原样。
++	src := []byte(`{
++		"model":"claude-opus-4-6",
++		"max_tokens":32000,
++		"stream":true,
++		"thinking":{"type":"adaptive"},
++		"output_config":{"effort":"medium"},
++		"context_management":{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]},
++		"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude.","cache_control":{"type":"ephemeral"}}],
++		"tools":[
++			{"name":"Bash","description":"run","input_schema":{"type":"object"},"eager_input_streaming":true},
++			{"type":"bash_20250124","name":"bash"},
++			{"type":"web_search_20250305","name":"web_search"}
++		],
++		"messages":[
++			{"role":"user","content":[
++				{"type":"text","text":"read "},
++				{"type":"document","title":"note","source":{"type":"text","media_type":"text/plain","data":"hello"}},
++				{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBE"}}
++			]},
++			{"role":"assistant","content":[
++				{"type":"server_tool_use","id":"srv_1","name":"web_search","input":{"q":"x"}}
++			]},
++			{"role":"user","content":[
++				{"type":"tool_result","tool_use_id":"srv_1","is_error":true,"content":[{"type":"text","text":"nope"}]}
++			]}
++		]
++	}`)
++	got, err := messagesToChat(src)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var obj map[string]any
++	if err := json.Unmarshal(got, &obj); err != nil {
++		t.Fatal(err)
++	}
++	if obj["model"] != "claude-opus-4-6" || obj["reasoning_effort"] != "medium" || obj["stream"] != true {
++		t.Fatalf("scalars=%v", obj)
++	}
++	if _, ok := obj["context_management"]; ok {
++		t.Fatal("context_management forwarded")
++	}
++	tools := obj["tools"].([]any)
++	if len(tools) != 1 || tools[0].(map[string]any)["function"].(map[string]any)["name"] != "Bash" {
++		t.Fatalf("tools=%v", tools)
++	}
++	msgs := obj["messages"].([]any)
++	if len(msgs) != 5 {
++		t.Fatalf("len=%d %#v", len(msgs), msgs)
++	}
++	if !strings.Contains(msgs[1].(map[string]any)["content"].(string), "bash") || !strings.Contains(msgs[1].(map[string]any)["content"].(string), "web_search") {
++		t.Fatalf("note=%v", msgs[1])
++	}
++	user := msgs[2].(map[string]any)["content"].([]any)
++	if user[1].(map[string]any)["text"] != "note\nhello" {
++		t.Fatalf("doc=%v", user[1])
++	}
++	if user[2].(map[string]any)["text"] != "[document application/pdf omitted]" {
++		t.Fatalf("pdf=%v", user[2])
++	}
++	asst := msgs[3].(map[string]any)
++	if asst["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)["name"] != "web_search" {
++		t.Fatalf("server tool=%v", asst)
++	}
++	if msgs[4].(map[string]any)["content"] != "error: nope" {
++		t.Fatalf("result=%v", msgs[4])
++	}
++}
++
++func TestEffortFromBudget(t *testing.T) {
++	got, err := messagesToChat([]byte(`{"model":"m","thinking":{"type":"enabled","budget_tokens":16000},"messages":[]}`))
++	if err != nil {
++		t.Fatal(err)
++	}
++	var obj map[string]any
++	if err := json.Unmarshal(got, &obj); err != nil {
++		t.Fatal(err)
++	}
++	if obj["reasoning_effort"] != "high" {
++		t.Fatalf("effort=%v", obj["reasoning_effort"])
++	}
++	got, err = messagesToChat([]byte(`{"model":"m","thinking":{"type":"disabled"},"output_config":{"effort":"low"},"messages":[]}`))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := json.Unmarshal(got, &obj); err != nil {
++		t.Fatal(err)
++	}
++	if obj["reasoning_effort"] != "low" {
++		t.Fatalf("effort wins=%v", obj["reasoning_effort"])
++	}
++}
++
++func TestChatCompletionToMessage(t *testing.T) {
++	got := chatCompletionToMessage(map[string]any{
++		"id":    "chatcmpl-1",
++		"model": "glm-5.2",
++		"choices": []any{map[string]any{
++			"message": map[string]any{
++				"role":              "assistant",
++				"content":           "hi",
++				"reasoning_content": "think",
++				"tool_calls": []any{map[string]any{
++					"id":       "call_a",
++					"type":     "function",
++					"function": map[string]any{"name": "Bash", "arguments": `{"cmd":"ls"}`},
++				}},
++			},
++			"finish_reason": "tool_calls",
++		}},
++		"usage": map[string]any{"prompt_tokens": 1, "completion_tokens": 2},
++	})
++	if got["id"] != "msg_chatcmpl-1" || got["type"] != "message" || got["stop_reason"] != "tool_use" {
++		t.Fatalf("envelope=%v", got)
++	}
++	if strings.Contains(mustJSON(got), "think") {
++		t.Fatalf("reasoning leaked: %v", got)
++	}
++	content := got["content"].([]any)
++	if content[0].(map[string]any)["text"] != "hi" {
++		t.Fatalf("text=%v", content[0])
++	}
++	tu := content[1].(map[string]any)
++	in := tu["input"].(map[string]any)
++	if tu["type"] != "tool_use" || tu["id"] != "call_a" || in["cmd"] != "ls" {
++		t.Fatalf("tool_use=%v", tu)
++	}
++	u := got["usage"].(map[string]any)
++	if u["input_tokens"] != 1 || u["output_tokens"] != 2 {
++		t.Fatalf("usage=%v", u)
++	}
++}
++
++func TestMessagesStreamEventOrder(t *testing.T) {
++	rec := httptest.NewRecorder()
++	rw := &messagesWriter{ResponseWriter: rec, stream: true}
++	rw.Header().Set("Content-Type", "text/event-stream")
++	frames := []string{
++		`data: {"id":"chatcmpl-1","model":"glm-5.2","choices":[{"index":0,"delta":{"reasoning_content":"think"}}]}` + "\n\n",
++		`data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"hi"}}]}` + "\n\n",
++		`data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"Bash","arguments":"{\"x\":"}}]}}]}` + "\n\n",
++		`data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}` + "\n\n",
++		`data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}` + "\n\n",
++		"data: [DONE]\n\n",
++	}
++	for _, f := range frames {
++		if _, err := rw.Write([]byte(f)); err != nil {
++			t.Fatal(err)
++		}
++	}
++	rw.finish()
++	body := rec.Body.String()
++	types := sseTypes(body)
++	want := []string{"message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"}
++	for _, n := range want {
++		if !containsStr(types, n) {
++			t.Fatalf("missing %s in %v\n%s", n, types, body)
++		}
++	}
++	if types[0] != "message_start" || types[len(types)-1] != "message_stop" {
++		t.Fatalf("order=%v", types)
++	}
++	if strings.Contains(body, "think") || strings.Contains(body, "data: [DONE]") {
++		t.Fatalf("leak: %s", body)
++	}
++	if !strings.Contains(body, `"text":"hi"`) || !strings.Contains(body, `"partial_json":"{\"x\":"`) || !strings.Contains(body, `"partial_json":"1}"`) {
++		t.Fatalf("deltas missing: %s", body)
++	}
++	if !strings.Contains(body, `"stop_reason":"tool_use"`) {
++		t.Fatalf("stop missing: %s", body)
++	}
++}
++
++func TestMessagesEndpoint(t *testing.T) {
++	for _, path := range []string{"/v1/messages", "/messages"} {
++		up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
++		p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
++		h := NewHandler(Config{Pool: p, Upstream: up})
++		rec := httptest.NewRecorder()
++		req := httptest.NewRequest("POST", path, strings.NewReader(`{"model":"glm-5.2","max_tokens":16,"messages":[{"role":"user","content":"hi"}],"stream":false}`))
++		h.ServeHTTP(rec, req)
++		if rec.Code != 200 {
++			t.Fatalf("%s code=%d body=%s", path, rec.Code, rec.Body.Bytes())
++		}
++		var obj map[string]any
++		if err := json.Unmarshal(rec.Body.Bytes(), &obj); err != nil {
++			t.Fatal(err)
++		}
++		if obj["type"] != "message" || obj["stop_reason"] != "end_turn" {
++			t.Fatalf("%s got=%v", path, obj)
++		}
++		text := obj["content"].([]any)[0].(map[string]any)["text"]
++		if text != "你好" {
++			t.Fatalf("%s text=%v", path, text)
++		}
++	}
++}
++
++func TestMessagesEndpointStream(t *testing.T) {
++	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
++	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
++	h := NewHandler(Config{Pool: p, Upstream: up})
++	rec := httptest.NewRecorder()
++	req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{"model":"glm-5.2","max_tokens":16,"messages":[{"role":"user","content":"hi"}],"stream":true}`))
++	h.ServeHTTP(rec, req)
++	if rec.Code != 200 {
++		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.Bytes())
++	}
++	if !strings.Contains(rec.Header().Get("Content-Type"), "event-stream") {
++		t.Fatalf("ct=%s", rec.Header().Get("Content-Type"))
++	}
++	types := sseTypes(rec.Body.String())
++	if len(types) == 0 || types[0] != "message_start" || types[len(types)-1] != "message_stop" {
++		t.Fatalf("types=%v body=%s", types, rec.Body.String())
++	}
++	if !containsStr(types, "content_block_delta") {
++		t.Fatalf("no text delta in %v", types)
++	}
++}
++
++func TestMessagesEndpointStreamErrorBeforeSSE(t *testing.T) {
++	h := NewHandler(Config{Pool: pool.New(""), Upstream: &upstream.Client{}})
++	rec := httptest.NewRecorder()
++	req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{"model":"glm-5.2","max_tokens":16,"messages":[{"role":"user","content":"hi"}],"stream":true}`))
++	h.ServeHTTP(rec, req)
++	if rec.Code != 200 {
++		t.Fatalf("code=%d want 200 SSE", rec.Code)
++	}
++	types := sseTypes(rec.Body.String())
++	if !containsStr(types, "error") {
++		t.Fatalf("types=%v body=%s", types, rec.Body.String())
++	}
++	if containsStr(types, "message_stop") {
++		t.Fatalf("failed stream must not stop cleanly: %v", types)
++	}
++}
++
++func TestMessagesAuthXAPIKey(t *testing.T) {
++	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
++	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
++	h := NewHandler(Config{Pool: p, Upstream: up, APIKey: "secret"})
++
++	rec := httptest.NewRecorder()
++	req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
++	h.ServeHTTP(rec, req)
++	if rec.Code != http.StatusUnauthorized {
++		t.Fatalf("missing key code=%d", rec.Code)
++	}
++	var obj map[string]any
++	if err := json.Unmarshal(rec.Body.Bytes(), &obj); err != nil {
++		t.Fatal(err)
++	}
++	if obj["type"] != "error" || obj["error"].(map[string]any)["type"] != "authentication_error" {
++		t.Fatalf("auth body=%v", obj)
++	}
++
++	rec = httptest.NewRecorder()
++	req = httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
++	req.Header.Set("x-api-key", "secret")
++	h.ServeHTTP(rec, req)
++	if rec.Code != 200 {
++		t.Fatalf("x-api-key code=%d body=%s", rec.Code, rec.Body.Bytes())
++	}
++}
++
++func TestMessagesInvalidJSON(t *testing.T) {
++	_, err := messagesToChat([]byte(`{`))
++	if err == nil {
++		t.Fatal("want error")
++	}
++	h := NewHandler(Config{Pool: pool.New(""), Upstream: &upstream.Client{}})
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", bytes.NewReader([]byte(`{`))))
++	if rec.Code != http.StatusBadRequest {
++		t.Fatalf("code=%d", rec.Code)
++	}
++	var obj map[string]any
++	if err := json.Unmarshal(rec.Body.Bytes(), &obj); err != nil {
++		t.Fatal(err)
++	}
++	if obj["type"] != "error" {
++		t.Fatalf("body=%v", obj)
++	}
++}
++
++func TestMessagesEndpointNonStreamError(t *testing.T) {
++	h := NewHandler(Config{Pool: pool.New(""), Upstream: &upstream.Client{}})
++	rec := httptest.NewRecorder()
++	req := httptest.NewRequest("POST", "/messages", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"stream":false}`))
++	h.ServeHTTP(rec, req)
++	if rec.Code == http.StatusOK {
++		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.Bytes())
++	}
++	var obj map[string]any
++	if err := json.Unmarshal(rec.Body.Bytes(), &obj); err != nil {
++		t.Fatalf("body=%s err=%v", rec.Body.Bytes(), err)
++	}
++	errObj, _ := obj["error"].(map[string]any)
++	if obj["type"] != "error" || errObj["type"] == "" || errObj["message"] == "" {
++		t.Fatalf("code=%d body=%v", rec.Code, obj)
++	}
++}
+diff -ruN --strip-trailing-cr /root/build/up-clean/internal/server/reqlog_path_test.go /root/build/wb2api-1.11.11/internal/server/reqlog_path_test.go
+--- /root/build/up-clean/internal/server/reqlog_path_test.go	1970-01-01 08:00:00.000000000 +0800
++++ /root/build/wb2api-1.11.11/internal/server/reqlog_path_test.go	2026-10-04 12:44:41.209316489 +0800
+@@ -0,0 +1,50 @@
++package server
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
++	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
++)
++
++// 三种入站协议共用同一条 chat 管线与统计，归档事件必须记**真实**路径：
++// 既不能把 /v1/messages、/v1/responses 的流量丢掉（面板运行日志整片消失），
++// 也不能把它们统一写成 /v1/chat/completions（来源无法区分）。
++func TestRequestMetricsRecordsAllInboundPaths(t *testing.T) {
++	cases := []struct {
++		path string
++		body string
++	}{
++		{"/v1/chat/completions", `{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`},
++		{"/v1/messages", `{"model":"glm-5.2","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}`},
++		{"/messages", `{"model":"glm-5.2","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}`},
++		{"/v1/responses", `{"model":"glm-5.2","input":"hi","stream":true}`},
++	}
++	for _, tc := range cases {
++		up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
++		reqLog := reqlog.New(reqlog.Config{})
++		h := NewHandler(Config{
++			Pool:       testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
++			Upstream:   up,
++			RequestLog: reqLog,
++		})
++		rec := httptest.NewRecorder()
++		h.ServeHTTP(rec, httptest.NewRequest("POST", tc.path, strings.NewReader(tc.body)))
++		if rec.Code != http.StatusOK {
++			t.Fatalf("%s: code=%d body=%s", tc.path, rec.Code, rec.Body)
++		}
++		s := reqLog.Snapshot()
++		if len(s.Recent) != 1 {
++			t.Fatalf("%s: recent=%d, want 1（该路径未进归档）", tc.path, len(s.Recent))
++		}
++		if got := s.Recent[0].Path; got != tc.path {
++			t.Errorf("%s: event path=%q, want %q", tc.path, got, tc.path)
++		}
++		if got := s.Recent[0].Model; got != "glm-5.2" {
++			t.Errorf("%s: event model=%q, want glm-5.2", tc.path, got)
++		}
++	}
++}
+diff -ruN --strip-trailing-cr /root/build/up-clean/internal/server/responses.go /root/build/wb2api-1.11.11/internal/server/responses.go
+--- /root/build/up-clean/internal/server/responses.go	1970-01-01 08:00:00.000000000 +0800
++++ /root/build/wb2api-1.11.11/internal/server/responses.go	2026-10-04 12:17:16.521059421 +0800
+@@ -0,0 +1,873 @@
++// responses.go Codex Responses 入站适配：POST /v1/responses ↔ 现有 chatCompletions。
++// ponytail: 不存 previous_response_id / store；Codex 每轮带全量 input。
++package server
++
++import (
++	"bytes"
++	"encoding/json"
++	"io"
++	"net/http"
++	"strings"
++)
++
++func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
++	body, err := io.ReadAll(r.Body)
++	if err != nil {
++		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
++		return
++	}
++	chat, err := responsesToChat(body)
++	if err != nil {
++		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
++		return
++	}
++	var peek struct {
++		Stream bool `json:"stream"`
++	}
++	_ = json.Unmarshal(chat, &peek)
++	r2 := r.Clone(r.Context())
++	r2.Body = io.NopCloser(bytes.NewReader(chat))
++	r2.ContentLength = int64(len(chat))
++	rw := &responsesWriter{ResponseWriter: w, stream: peek.Stream}
++	defer rw.finish()
++	h.chatCompletions(rw, r2)
++}
++
++func responsesToChat(src []byte) ([]byte, error) {
++	var obj map[string]any
++	if err := json.Unmarshal(src, &obj); err != nil {
++		return nil, err
++	}
++	out := map[string]any{}
++	for _, k := range []string{
++		"model", "stream", "tool_choice", "max_tokens", "max_output_tokens",
++		"max_completion_tokens", "temperature", "top_p", "user", "n", "stop",
++		"metadata", "stream_options", "parallel_tool_calls",
++		// ponytail: Codex 客户端按会话发 prompt_cache_key；丢掉就只能靠内容派生会话键。
++		"prompt_cache_key",
++	} {
++		if v, ok := obj[k]; ok {
++			out[k] = v
++		}
++	}
++	if r, ok := obj["reasoning"].(map[string]any); ok {
++		if e, ok := r["effort"]; ok {
++			out["reasoning_effort"] = e
++		}
++	}
++	if v, ok := obj["reasoning_effort"]; ok {
++		out["reasoning_effort"] = v
++	}
++	if tools, ok := obj["tools"].([]any); ok {
++		out["tools"] = convertTools(tools)
++	}
++	msgs := []any{}
++	if inst, ok := obj["instructions"].(string); ok && inst != "" {
++		msgs = append(msgs, map[string]any{"role": "system", "content": inst})
++	}
++	switch in := obj["input"].(type) {
++	case string:
++		if in != "" {
++			msgs = append(msgs, map[string]any{"role": "user", "content": in})
++		}
++	case []any:
++		msgs = append(msgs, convertInputItems(in)...)
++	}
++	out["messages"] = msgs
++	return json.Marshal(out)
++}
++
++func convertTools(tools []any) []any {
++	out := make([]any, 0, len(tools))
++	for _, t := range tools {
++		m, ok := t.(map[string]any)
++		if !ok {
++			out = append(out, t)
++			continue
++		}
++		if _, ok := m["function"].(map[string]any); ok {
++			out = append(out, m)
++			continue
++		}
++		typ, _ := m["type"].(string)
++		if typ == "" || typ == "function" {
++			fn := map[string]any{}
++			for _, k := range []string{"name", "description", "parameters", "strict"} {
++				if v, ok := m[k]; ok {
++					fn[k] = v
++				}
++			}
++			out = append(out, map[string]any{"type": "function", "function": fn})
++			continue
++		}
++		out = append(out, m)
++	}
++	return out
++}
++
++func convertInputItems(items []any) []any {
++	var out []any
++	var pending []any
++	flush := func() {
++		if len(pending) == 0 {
++			return
++		}
++		out = append(out, map[string]any{"role": "assistant", "content": "", "tool_calls": pending})
++		pending = nil
++	}
++	for _, it := range items {
++		m, ok := it.(map[string]any)
++		if !ok {
++			continue
++		}
++		typ, _ := m["type"].(string)
++		switch typ {
++		case "reasoning", "item_reference":
++			flush()
++			continue
++		case "function_call":
++			pending = append(pending, toToolCall(m))
++			continue
++		case "function_call_output":
++			flush()
++			out = append(out, map[string]any{
++				"role":         "tool",
++				"tool_call_id": asString(m["call_id"]),
++				"content":      asContentString(m["output"]),
++			})
++			continue
++		}
++		flush()
++		role, _ := m["role"].(string)
++		if role == "" {
++			role = "user"
++		}
++		out = append(out, map[string]any{"role": role, "content": convertContent(m["content"])})
++	}
++	flush()
++	return out
++}
++
++func toToolCall(m map[string]any) map[string]any {
++	callID := asString(m["call_id"])
++	if callID == "" {
++		callID = asString(m["id"])
++	}
++	return map[string]any{
++		"id":   callID,
++		"type": "function",
++		"function": map[string]any{
++			"name":      asString(m["name"]),
++			"arguments": asString(m["arguments"]),
++		},
++	}
++}
++
++func convertContent(c any) any {
++	switch v := c.(type) {
++	case string:
++		return v
++	case []any:
++		var texts []string
++		var parts []any
++		hasNonText := false
++		for _, p := range v {
++			m, ok := p.(map[string]any)
++			if !ok {
++				continue
++			}
++			typ, _ := m["type"].(string)
++			switch typ {
++			case "input_text", "output_text", "text", "":
++				t := asString(m["text"])
++				texts = append(texts, t)
++				parts = append(parts, map[string]any{"type": "text", "text": t})
++			case "input_image":
++				hasNonText = true
++				parts = append(parts, map[string]any{
++					"type":      "image_url",
++					"image_url": map[string]any{"url": imageURLFrom(m)},
++				})
++			}
++		}
++		if !hasNonText {
++			return strings.Join(texts, "")
++		}
++		return parts
++	default:
++		return asContentString(c)
++	}
++}
++
++func imageURLFrom(m map[string]any) string {
++	switch u := m["image_url"].(type) {
++	case string:
++		return u
++	case map[string]any:
++		return asString(u["url"])
++	}
++	return asString(m["url"])
++}
++
++func asString(v any) string {
++	switch t := v.(type) {
++	case string:
++		return t
++	case nil:
++		return ""
++	default:
++		b, err := json.Marshal(t)
++		if err != nil {
++			return ""
++		}
++		return string(b)
++	}
++}
++
++func asContentString(v any) string {
++	switch t := v.(type) {
++	case string:
++		return t
++	case []any:
++		var b strings.Builder
++		for _, p := range t {
++			if m, ok := p.(map[string]any); ok {
++				b.WriteString(asString(m["text"]))
++			}
++		}
++		return b.String()
++	default:
++		return asString(v)
++	}
++}
++
++func chatCompletionToResponse(obj map[string]any) map[string]any {
++	id, _ := obj["id"].(string)
++	model, _ := obj["model"].(string)
++	var created int64
++	switch v := obj["created"].(type) {
++	case float64:
++		created = int64(v)
++	case int64:
++		created = v
++	case int:
++		created = int64(v)
++	}
++	var msg map[string]any
++	if chs, ok := obj["choices"].([]any); ok && len(chs) > 0 {
++		if c, ok := chs[0].(map[string]any); ok {
++			msg, _ = c["message"].(map[string]any)
++		}
++	}
++	output := []any{}
++	if msg != nil {
++		if rc, ok := msg["reasoning_content"].(string); ok && rc != "" {
++			output = append(output, map[string]any{
++				"id":      "rs_" + id,
++				"type":    "reasoning",
++				"summary": []any{},
++				"content": []any{map[string]any{"type": "reasoning_text", "text": rc}},
++			})
++		}
++		content, _ := msg["content"].(string)
++		tcs, _ := msg["tool_calls"].([]any)
++		if content != "" || len(tcs) == 0 {
++			output = append(output, map[string]any{
++				"id":      "msg_" + id,
++				"type":    "message",
++				"status":  "completed",
++				"role":    "assistant",
++				"content": []any{map[string]any{"type": "output_text", "text": content}},
++			})
++		}
++		for _, tci := range tcs {
++			tc, _ := tci.(map[string]any)
++			if tc == nil {
++				continue
++			}
++			fn, _ := tc["function"].(map[string]any)
++			name, args := "", ""
++			if fn != nil {
++				name = asString(fn["name"])
++				args = asString(fn["arguments"])
++			}
++			callID := asString(tc["id"])
++			output = append(output, map[string]any{
++				"id":        callID,
++				"type":      "function_call",
++				"call_id":   callID,
++				"name":      name,
++				"arguments": args,
++				"status":    "completed",
++			})
++		}
++	}
++	out := map[string]any{
++		"id":         respID(id),
++		"object":     "response",
++		"created_at": created,
++		"status":     "completed",
++		"model":      model,
++		"output":     output,
++	}
++	if u, ok := obj["usage"].(map[string]any); ok && u != nil {
++		out["usage"] = convertUsage(u)
++	}
++	return out
++}
++
++func convertUsage(u map[string]any) map[string]any {
++	out := map[string]any{}
++	if v, ok := u["prompt_tokens"]; ok {
++		out["input_tokens"] = v
++	}
++	if v, ok := u["completion_tokens"]; ok {
++		out["output_tokens"] = v
++	}
++	if v, ok := u["total_tokens"]; ok {
++		out["total_tokens"] = v
++	}
++	// ponytail: Responses 客户端的缓存读数在 input_tokens_details.cached_tokens
++	// （Codex 据此显示 cached），上游已在 prompt_tokens_details.cached_tokens 给出。
++	if d, ok := u["prompt_tokens_details"].(map[string]any); ok {
++		if c, ok := d["cached_tokens"]; ok {
++			out["input_tokens_details"] = map[string]any{"cached_tokens": c}
++		}
++	}
++	return out
++}
++
++func respID(chatID string) string {
++	if chatID == "" {
++		chatID = "wb2api"
++	}
++	if strings.HasPrefix(chatID, "resp_") {
++		return chatID
++	}
++	return "resp_" + chatID
++}
++
++type responsesWriter struct {
++	http.ResponseWriter
++	stream  bool
++	status  int
++	hdrSent bool
++	rest    []byte
++	body    []byte
++	x       streamState
++}
++
++type streamState struct {
++	created, failed, completed bool
++	id, model                  string
++	outN                       int
++	reasoningOpen              bool
++	reasoningIdx               int
++	reasoningID                string
++	reasoningText              strings.Builder
++	messageOpen, textOpen      bool
++	messageIdx                 int
++	msgID                      string
++	messageText                strings.Builder
++	tools                      map[int]*toolAcc
++	toolOrder                  []int
++	usage                      map[string]any
++	output                     []any
++}
++
++type toolAcc struct {
++	idx, outIdx    int
++	id, name       string
++	args           strings.Builder
++	opened, closed bool
++}
++
++func (w *responsesWriter) Header() http.Header { return w.ResponseWriter.Header() }
++
++func (w *responsesWriter) WriteHeader(code int) { w.status = code }
++
++func (w *responsesWriter) Flush() {
++	if f, ok := w.ResponseWriter.(http.Flusher); ok {
++		f.Flush()
++	}
++}
++
++func (w *responsesWriter) Write(p []byte) (int, error) {
++	if w.stream && strings.Contains(w.Header().Get("Content-Type"), "event-stream") {
++		w.rest = append(w.rest, p...)
++		for {
++			i := bytes.Index(w.rest, []byte("\n\n"))
++			if i < 0 {
++				break
++			}
++			frame := string(bytes.TrimSpace(w.rest[:i]))
++			w.rest = w.rest[i+2:]
++			if err := w.handleFrame(frame); err != nil {
++				return len(p), err
++			}
++		}
++		return len(p), nil
++	}
++	w.body = append(w.body, p...)
++	return len(p), nil
++}
++
++func (w *responsesWriter) finish() {
++	if w.stream {
++		if strings.Contains(w.Header().Get("Content-Type"), "event-stream") || w.hdrSent {
++			if w.x.created && !w.x.completed && !w.x.failed {
++				_ = w.closeOpenItems()
++				_ = w.emitCompleted()
++			}
++			return
++		}
++		_ = w.emitJSONErrorAsFailed()
++		return
++	}
++	w.flushJSON()
++}
++
++func (w *responsesWriter) flushJSON() {
++	status := w.status
++	if status == 0 {
++		status = http.StatusOK
++	}
++	w.Header().Set("Content-Type", "application/json")
++	if len(w.body) == 0 {
++		w.ResponseWriter.WriteHeader(status)
++		return
++	}
++	var obj map[string]any
++	if json.Unmarshal(w.body, &obj) != nil {
++		w.ResponseWriter.WriteHeader(status)
++		_, _ = w.ResponseWriter.Write(w.body)
++		return
++	}
++	if _, hasErr := obj["error"]; hasErr {
++		w.ResponseWriter.WriteHeader(status)
++		_, _ = w.ResponseWriter.Write(w.body)
++		return
++	}
++	raw, err := json.Marshal(chatCompletionToResponse(obj))
++	if err != nil {
++		w.ResponseWriter.WriteHeader(status)
++		_, _ = w.ResponseWriter.Write(w.body)
++		return
++	}
++	w.ResponseWriter.WriteHeader(status)
++	_, _ = w.ResponseWriter.Write(raw)
++}
++
++func (w *responsesWriter) emitJSONErrorAsFailed() error {
++	var obj map[string]any
++	_ = json.Unmarshal(w.body, &obj)
++	return w.emitFailed(obj["error"])
++}
++
++func (w *responsesWriter) handleFrame(frame string) error {
++	if w.x.failed || w.x.completed {
++		return nil
++	}
++	if strings.HasPrefix(frame, "data: [DONE]") {
++		_ = w.closeOpenItems()
++		return w.emitCompleted()
++	}
++	payload, ok := strings.CutPrefix(frame, "data: ")
++	if !ok {
++		return nil
++	}
++	var obj map[string]any
++	if json.Unmarshal([]byte(payload), &obj) != nil {
++		return nil
++	}
++	if errObj, ok := obj["error"]; ok {
++		return w.emitFailed(errObj)
++	}
++	return w.handleChunk(obj)
++}
++
++func (w *responsesWriter) handleChunk(obj map[string]any) error {
++	if !w.x.created {
++		id, _ := obj["id"].(string)
++		model, _ := obj["model"].(string)
++		w.x.id = id
++		w.x.model = model
++		w.x.created = true
++		if err := w.emit("response.created", map[string]any{
++			"response": map[string]any{
++				"id":     respID(id),
++				"object": "response",
++				"status": "in_progress",
++				"model":  model,
++				"output": []any{},
++			},
++		}); err != nil {
++			return err
++		}
++	}
++	if u, ok := obj["usage"].(map[string]any); ok && u != nil {
++		w.x.usage = u
++	}
++	chs, _ := obj["choices"].([]any)
++	if len(chs) == 0 {
++		return nil
++	}
++	c, _ := chs[0].(map[string]any)
++	if c == nil {
++		return nil
++	}
++	if delta, _ := c["delta"].(map[string]any); delta != nil {
++		if rc, ok := delta["reasoning_content"].(string); ok && rc != "" {
++			if err := w.ensureReasoning(); err != nil {
++				return err
++			}
++			w.x.reasoningText.WriteString(rc)
++			if err := w.emit("response.reasoning_text.delta", map[string]any{
++				"item_id":       w.x.reasoningID,
++				"output_index":  w.x.reasoningIdx,
++				"content_index": 0,
++				"delta":         rc,
++			}); err != nil {
++				return err
++			}
++		}
++		if txt, ok := delta["content"].(string); ok && txt != "" {
++			if err := w.ensureMessageText(); err != nil {
++				return err
++			}
++			w.x.messageText.WriteString(txt)
++			if err := w.emit("response.output_text.delta", map[string]any{
++				"item_id":       w.x.msgID,
++				"output_index":  w.x.messageIdx,
++				"content_index": 0,
++				"delta":         txt,
++			}); err != nil {
++				return err
++			}
++		}
++		if tcs, ok := delta["tool_calls"].([]any); ok {
++			if err := w.handleToolDeltas(tcs); err != nil {
++				return err
++			}
++		}
++	}
++	if fr, ok := c["finish_reason"].(string); ok && fr != "" {
++		return w.closeOpenItems()
++	}
++	return nil
++}
++
++func (w *responsesWriter) nextIdx() int {
++	i := w.x.outN
++	w.x.outN++
++	return i
++}
++
++func (w *responsesWriter) ensureReasoning() error {
++	if w.x.reasoningOpen {
++		return nil
++	}
++	w.x.reasoningIdx = w.nextIdx()
++	w.x.reasoningID = "rs_" + w.x.id
++	w.x.reasoningOpen = true
++	return w.emit("response.output_item.added", map[string]any{
++		"output_index": w.x.reasoningIdx,
++		"item": map[string]any{
++			"id":      w.x.reasoningID,
++			"type":    "reasoning",
++			"summary": []any{},
++			"content": []any{},
++		},
++	})
++}
++
++func (w *responsesWriter) ensureMessageText() error {
++	if err := w.closeReasoning(); err != nil {
++		return err
++	}
++	if w.x.textOpen {
++		return nil
++	}
++	if !w.x.messageOpen {
++		w.x.messageIdx = w.nextIdx()
++		w.x.msgID = "msg_" + w.x.id
++		w.x.messageOpen = true
++		if err := w.emit("response.output_item.added", map[string]any{
++			"output_index": w.x.messageIdx,
++			"item": map[string]any{
++				"id":      w.x.msgID,
++				"type":    "message",
++				"status":  "in_progress",
++				"role":    "assistant",
++				"content": []any{},
++			},
++		}); err != nil {
++			return err
++		}
++	}
++	w.x.textOpen = true
++	return w.emit("response.content_part.added", map[string]any{
++		"item_id":       w.x.msgID,
++		"output_index":  w.x.messageIdx,
++		"content_index": 0,
++		"part":          map[string]any{"type": "output_text", "text": ""},
++	})
++}
++
++func (w *responsesWriter) handleToolDeltas(tcs []any) error {
++	if err := w.closeReasoning(); err != nil {
++		return err
++	}
++	if err := w.closeMessage(); err != nil {
++		return err
++	}
++	if w.x.tools == nil {
++		w.x.tools = map[int]*toolAcc{}
++	}
++	for _, tci := range tcs {
++		tc, _ := tci.(map[string]any)
++		if tc == nil {
++			continue
++		}
++		idx := 0
++		if v, ok := tc["index"].(float64); ok {
++			idx = int(v)
++		}
++		acc, ok := w.x.tools[idx]
++		if !ok {
++			acc = &toolAcc{idx: idx}
++			w.x.tools[idx] = acc
++			w.x.toolOrder = append(w.x.toolOrder, idx)
++		}
++		if id := asString(tc["id"]); id != "" {
++			acc.id = id
++		}
++		if fn, _ := tc["function"].(map[string]any); fn != nil {
++			if n := asString(fn["name"]); n != "" {
++				acc.name = n
++			}
++			if a, ok := fn["arguments"].(string); ok && a != "" {
++				acc.args.WriteString(a)
++				if !acc.opened {
++					if err := w.openTool(acc); err != nil {
++						return err
++					}
++				}
++				if err := w.emit("response.function_call_arguments.delta", map[string]any{
++					"item_id":      acc.id,
++					"output_index": acc.outIdx,
++					"delta":        a,
++				}); err != nil {
++					return err
++				}
++				continue
++			}
++		}
++		if !acc.opened {
++			if err := w.openTool(acc); err != nil {
++				return err
++			}
++		}
++	}
++	return nil
++}
++
++func (w *responsesWriter) openTool(acc *toolAcc) error {
++	if acc.opened {
++		return nil
++	}
++	acc.outIdx = w.nextIdx()
++	if acc.id == "" {
++		acc.id = "call_" + asString(acc.idx)
++	}
++	acc.opened = true
++	return w.emit("response.output_item.added", map[string]any{
++		"output_index": acc.outIdx,
++		"item": map[string]any{
++			"id":        acc.id,
++			"type":      "function_call",
++			"status":    "in_progress",
++			"call_id":   acc.id,
++			"name":      acc.name,
++			"arguments": "",
++		},
++	})
++}
++
++func (w *responsesWriter) closeOpenItems() error {
++	if err := w.closeReasoning(); err != nil {
++		return err
++	}
++	if err := w.closeMessage(); err != nil {
++		return err
++	}
++	for _, idx := range w.x.toolOrder {
++		acc := w.x.tools[idx]
++		if acc == nil || acc.closed {
++			continue
++		}
++		if !acc.opened {
++			if err := w.openTool(acc); err != nil {
++				return err
++			}
++		}
++		if err := w.emit("response.function_call_arguments.done", map[string]any{
++			"item_id":      acc.id,
++			"output_index": acc.outIdx,
++			"arguments":    acc.args.String(),
++		}); err != nil {
++			return err
++		}
++		item := map[string]any{
++			"id":        acc.id,
++			"type":      "function_call",
++			"status":    "completed",
++			"call_id":   acc.id,
++			"name":      acc.name,
++			"arguments": acc.args.String(),
++		}
++		if err := w.emit("response.output_item.done", map[string]any{
++			"output_index": acc.outIdx,
++			"item":         item,
++		}); err != nil {
++			return err
++		}
++		w.x.output = append(w.x.output, item)
++		acc.closed = true
++	}
++	return nil
++}
++
++func (w *responsesWriter) closeReasoning() error {
++	if !w.x.reasoningOpen {
++		return nil
++	}
++	if err := w.emit("response.reasoning_text.done", map[string]any{
++		"item_id":       w.x.reasoningID,
++		"output_index":  w.x.reasoningIdx,
++		"content_index": 0,
++		"text":          w.x.reasoningText.String(),
++	}); err != nil {
++		return err
++	}
++	item := map[string]any{
++		"id":      w.x.reasoningID,
++		"type":    "reasoning",
++		"summary": []any{},
++		"content": []any{map[string]any{"type": "reasoning_text", "text": w.x.reasoningText.String()}},
++	}
++	if err := w.emit("response.output_item.done", map[string]any{
++		"output_index": w.x.reasoningIdx,
++		"item":         item,
++	}); err != nil {
++		return err
++	}
++	w.x.output = append(w.x.output, item)
++	w.x.reasoningOpen = false
++	return nil
++}
++
++func (w *responsesWriter) closeMessage() error {
++	if !w.x.messageOpen {
++		return nil
++	}
++	if w.x.textOpen {
++		if err := w.emit("response.output_text.done", map[string]any{
++			"item_id":       w.x.msgID,
++			"output_index":  w.x.messageIdx,
++			"content_index": 0,
++			"text":          w.x.messageText.String(),
++		}); err != nil {
++			return err
++		}
++		if err := w.emit("response.content_part.done", map[string]any{
++			"item_id":       w.x.msgID,
++			"output_index":  w.x.messageIdx,
++			"content_index": 0,
++		}); err != nil {
++			return err
++		}
++		w.x.textOpen = false
++	}
++	item := map[string]any{
++		"id":     w.x.msgID,
++		"type":   "message",
++		"status": "completed",
++		"role":   "assistant",
++		"content": []any{
++			map[string]any{"type": "output_text", "text": w.x.messageText.String()},
++		},
++	}
++	if err := w.emit("response.output_item.done", map[string]any{
++		"output_index": w.x.messageIdx,
++		"item":         item,
++	}); err != nil {
++		return err
++	}
++	w.x.output = append(w.x.output, item)
++	w.x.messageOpen = false
++	return nil
++}
++
++func (w *responsesWriter) emitCompleted() error {
++	if w.x.completed || w.x.failed {
++		return nil
++	}
++	w.x.completed = true
++	resp := map[string]any{
++		"id":     respID(w.x.id),
++		"object": "response",
++		"status": "completed",
++		"model":  w.x.model,
++		"output": w.x.output,
++	}
++	if w.x.usage != nil {
++		resp["usage"] = convertUsage(w.x.usage)
++	}
++	return w.emit("response.completed", map[string]any{"response": resp})
++}
++
++func (w *responsesWriter) emitFailed(errObj any) error {
++	if w.x.failed {
++		return nil
++	}
++	w.x.failed = true
++	if errObj == nil {
++		errObj = map[string]any{"message": "upstream error", "type": "api_error"}
++	}
++	return w.emit("response.failed", map[string]any{
++		"response": map[string]any{
++			"id":     respID(w.x.id),
++			"object": "response",
++			"status": "failed",
++			"error":  errObj,
++		},
++	})
++}
++
++func (w *responsesWriter) emit(typ string, payload map[string]any) error {
++	if payload == nil {
++		payload = map[string]any{}
++	}
++	payload["type"] = typ
++	raw, err := json.Marshal(payload)
++	if err != nil {
++		return err
++	}
++	if !w.hdrSent {
++		h := w.Header()
++		h.Set("Content-Type", "text/event-stream")
++		h.Set("Cache-Control", "no-cache")
++		h.Set("Connection", "keep-alive")
++		// ponytail: 不显式 WriteHeader——下面的 io.WriteString 会隐式提交 200。
++		// 流式路径的 Flush（StreamHint 逐帧 flush）可能已先提交，再显式调用就是
++		// net/http 的 "superfluous response.WriteHeader call" 噪音。
++		w.hdrSent = true
++		w.status = http.StatusOK
++	}
++	if _, err := io.WriteString(w.ResponseWriter, "event: "+typ+"\ndata: "+string(raw)+"\n\n"); err != nil {
++		return err
++	}
++	w.Flush()
++	return nil
++}
+diff -ruN --strip-trailing-cr /root/build/up-clean/internal/server/responses_test.go /root/build/wb2api-1.11.11/internal/server/responses_test.go
+--- /root/build/up-clean/internal/server/responses_test.go	1970-01-01 08:00:00.000000000 +0800
++++ /root/build/wb2api-1.11.11/internal/server/responses_test.go	2026-10-04 12:17:29.674501180 +0800
+@@ -0,0 +1,418 @@
++package server
++
++import (
++	"bytes"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
++	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
++	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
++)
++
++func TestResponsesToChat(t *testing.T) {
++	src := []byte(`{
++		"model":"gpt-5.3-codex",
++		"instructions":"You are Codex",
++		"input":[
++			{"role":"user","content":[{"type":"input_text","text":"run ls"}]},
++			{"type":"function_call","call_id":"call_1","name":"Bash","arguments":"{\"cmd\":\"ls\"}"},
++			{"type":"function_call_output","call_id":"call_1","output":"a.txt"},
++			{"type":"reasoning","summary":[]}
++		],
++		"tools":[{"type":"function","name":"Bash","parameters":{"type":"object"}}],
++		"reasoning":{"effort":"medium"},
++		"max_output_tokens":128,
++		"store":true,
++		"previous_response_id":"resp_old"
++	}`)
++	got, err := responsesToChat(src)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var obj map[string]any
++	if err := json.Unmarshal(got, &obj); err != nil {
++		t.Fatal(err)
++	}
++	if _, ok := obj["store"]; ok {
++		t.Fatal("store must be dropped")
++	}
++	if _, ok := obj["previous_response_id"]; ok {
++		t.Fatal("previous_response_id must be dropped")
++	}
++	if _, ok := obj["input"]; ok {
++		t.Fatal("input must be translated away")
++	}
++	if obj["model"] != "gpt-5.3-codex" {
++		t.Fatalf("model=%v", obj["model"])
++	}
++	if obj["reasoning_effort"] != "medium" {
++		t.Fatalf("reasoning_effort=%v", obj["reasoning_effort"])
++	}
++	if obj["max_output_tokens"] != float64(128) {
++		t.Fatalf("max_output_tokens=%v", obj["max_output_tokens"])
++	}
++	tools, _ := obj["tools"].([]any)
++	if len(tools) != 1 {
++		t.Fatalf("tools=%v", tools)
++	}
++	tm := tools[0].(map[string]any)
++	fn := tm["function"].(map[string]any)
++	if fn["name"] != "Bash" {
++		t.Fatalf("tool name=%v", fn["name"])
++	}
++	msgs, _ := obj["messages"].([]any)
++	if len(msgs) != 4 {
++		t.Fatalf("messages len=%d %#v", len(msgs), msgs)
++	}
++	m0 := msgs[0].(map[string]any)
++	if m0["role"] != "system" || m0["content"] != "You are Codex" {
++		t.Fatalf("system=%v", m0)
++	}
++	m1 := msgs[1].(map[string]any)
++	if m1["role"] != "user" || m1["content"] != "run ls" {
++		t.Fatalf("user=%v", m1)
++	}
++	m2 := msgs[2].(map[string]any)
++	if m2["role"] != "assistant" {
++		t.Fatalf("assistant=%v", m2)
++	}
++	tcs := m2["tool_calls"].([]any)
++	tc := tcs[0].(map[string]any)
++	if tc["id"] != "call_1" {
++		t.Fatalf("call id=%v", tc["id"])
++	}
++	tfn := tc["function"].(map[string]any)
++	if tfn["name"] != "Bash" || tfn["arguments"] != `{"cmd":"ls"}` {
++		t.Fatalf("function=%v", tfn)
++	}
++	m3 := msgs[3].(map[string]any)
++	if m3["role"] != "tool" || m3["tool_call_id"] != "call_1" || m3["content"] != "a.txt" {
++		t.Fatalf("tool msg=%v", m3)
++	}
++}
++
++func TestResponsesToChatStringInput(t *testing.T) {
++	got, err := responsesToChat([]byte(`{"model":"m","input":"hi","stream":true}`))
++	if err != nil {
++		t.Fatal(err)
++	}
++	var obj map[string]any
++	_ = json.Unmarshal(got, &obj)
++	msgs := obj["messages"].([]any)
++	m := msgs[0].(map[string]any)
++	if m["role"] != "user" || m["content"] != "hi" {
++		t.Fatalf("got=%v", m)
++	}
++	if obj["stream"] != true {
++		t.Fatalf("stream=%v", obj["stream"])
++	}
++}
++
++func TestChatCompletionToResponse(t *testing.T) {
++	chat := map[string]any{
++		"id":      "chatcmpl-1",
++		"object":  "chat.completion",
++		"created": float64(1),
++		"model":   "m",
++		"choices": []any{map[string]any{
++			"index": 0,
++			"message": map[string]any{
++				"role":              "assistant",
++				"content":           "hi",
++				"reasoning_content": "think",
++				"tool_calls": []any{map[string]any{
++					"id":       "call_a",
++					"type":     "function",
++					"function": map[string]any{"name": "Bash", "arguments": "{}"},
++				}},
++			},
++			"finish_reason": "tool_calls",
++		}},
++		"usage": map[string]any{"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
++	}
++	got := chatCompletionToResponse(chat)
++	if got["id"] != "resp_chatcmpl-1" || got["object"] != "response" || got["status"] != "completed" {
++		t.Fatalf("envelope=%v", got)
++	}
++	out := got["output"].([]any)
++	if len(out) != 3 {
++		t.Fatalf("output len=%d %#v", len(out), out)
++	}
++	if out[0].(map[string]any)["type"] != "reasoning" {
++		t.Fatalf("item0=%v", out[0])
++	}
++	if out[1].(map[string]any)["type"] != "message" {
++		t.Fatalf("item1=%v", out[1])
++	}
++	if out[2].(map[string]any)["type"] != "function_call" {
++		t.Fatalf("item2=%v", out[2])
++	}
++	fc := out[2].(map[string]any)
++	if fc["call_id"] != "call_a" || fc["name"] != "Bash" {
++		t.Fatalf("function_call=%v", fc)
++	}
++	u := got["usage"].(map[string]any)
++	if u["input_tokens"] != 1 || u["output_tokens"] != 2 {
++		t.Fatalf("usage=%v", u)
++	}
++}
++
++func TestResponsesStreamEventOrder(t *testing.T) {
++	rec := httptest.NewRecorder()
++	rw := &responsesWriter{ResponseWriter: rec, stream: true}
++	rw.Header().Set("Content-Type", "text/event-stream")
++	frames := []string{
++		`data: {"id":"chatcmpl-1","model":"gpt-5.3-codex","choices":[{"index":0,"delta":{"reasoning_content":"think"}}]}` + "\n\n",
++		`data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"hi"}}]}` + "\n\n",
++		`data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"Bash","arguments":"{\"x\":"}}]}}]}` + "\n\n",
++		`data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}` + "\n\n",
++		`data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}` + "\n\n",
++		"data: [DONE]\n\n",
++	}
++	for _, f := range frames {
++		if _, err := rw.Write([]byte(f)); err != nil {
++			t.Fatal(err)
++		}
++	}
++	rw.finish()
++	types := sseTypes(rec.Body.String())
++	if len(types) == 0 || types[0] != "response.created" {
++		t.Fatalf("first=%v", types)
++	}
++	if types[len(types)-1] != "response.completed" {
++		t.Fatalf("last=%v", types)
++	}
++	need := []string{
++		"response.reasoning_text.delta",
++		"response.output_text.delta",
++		"response.function_call_arguments.delta",
++		"response.completed",
++	}
++	for _, n := range need {
++		if !containsStr(types, n) {
++			t.Fatalf("missing %s in %v", n, types)
++		}
++	}
++	body := rec.Body.String()
++	if !strings.Contains(body, `"delta":"think"`) || !strings.Contains(body, `"delta":"hi"`) {
++		t.Fatalf("deltas missing: %s", body)
++	}
++	if !strings.Contains(body, `"delta":"{\"x\":"`) || !strings.Contains(body, `"delta":"1}"`) {
++		t.Fatalf("tool args missing: %s", body)
++	}
++	if strings.Contains(body, "data: [DONE]") {
++		t.Fatal("chat [DONE] must not leak")
++	}
++}
++
++func TestResponsesEndpointNonStream(t *testing.T) {
++	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
++	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
++	h := NewHandler(Config{Pool: p, Upstream: up})
++	rec := httptest.NewRecorder()
++	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(`{"model":"glm-5.2","input":"hi","stream":false}`))
++	h.ServeHTTP(rec, req)
++	if rec.Code != 200 {
++		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.Bytes())
++	}
++	var obj map[string]any
++	if err := json.Unmarshal(rec.Body.Bytes(), &obj); err != nil {
++		t.Fatal(err)
++	}
++	if obj["object"] != "response" || obj["status"] != "completed" {
++		t.Fatalf("got=%v", obj)
++	}
++	out := obj["output"].([]any)
++	found := false
++	for _, it := range out {
++		m := it.(map[string]any)
++		if m["type"] == "message" {
++			found = true
++			content := m["content"].([]any)
++			text := content[0].(map[string]any)["text"]
++			if text != "你好" {
++				t.Fatalf("text=%v", text)
++			}
++		}
++	}
++	if !found {
++		t.Fatalf("no message in %v", out)
++	}
++}
++
++func TestResponsesEndpointStream(t *testing.T) {
++	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
++	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
++	h := NewHandler(Config{Pool: p, Upstream: up})
++	rec := httptest.NewRecorder()
++	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(`{"model":"glm-5.2","input":"hi","stream":true}`))
++	h.ServeHTTP(rec, req)
++	if rec.Code != 200 {
++		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.Bytes())
++	}
++	if !strings.Contains(rec.Header().Get("Content-Type"), "event-stream") {
++		t.Fatalf("ct=%s", rec.Header().Get("Content-Type"))
++	}
++	types := sseTypes(rec.Body.String())
++	if len(types) == 0 || types[0] != "response.created" || types[len(types)-1] != "response.completed" {
++		t.Fatalf("types=%v body=%s", types, rec.Body.String())
++	}
++	if !containsStr(types, "response.output_text.delta") {
++		t.Fatalf("no text delta in %v", types)
++	}
++}
++
++func TestResponsesEndpointStreamErrorBeforeSSE(t *testing.T) {
++	h := NewHandler(Config{Pool: pool.New(""), Upstream: &upstream.Client{}})
++	rec := httptest.NewRecorder()
++	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(`{"model":"glm-5.2","input":"hi","stream":true}`))
++	h.ServeHTTP(rec, req)
++	if rec.Code != 200 {
++		t.Fatalf("code=%d want 200 SSE", rec.Code)
++	}
++	if !strings.Contains(rec.Header().Get("Content-Type"), "event-stream") {
++		t.Fatalf("ct=%s body=%s", rec.Header().Get("Content-Type"), rec.Body.String())
++	}
++	types := sseTypes(rec.Body.String())
++	if !containsStr(types, "response.failed") {
++		t.Fatalf("types=%v body=%s", types, rec.Body.String())
++	}
++	if containsStr(types, "response.completed") {
++		t.Fatalf("failed stream must not complete: %v", types)
++	}
++}
++
++func sseTypes(body string) []string {
++	var types []string
++	for _, block := range strings.Split(body, "\n\n") {
++		for _, line := range strings.Split(block, "\n") {
++			if !strings.HasPrefix(line, "data: ") {
++				continue
++			}
++			var m map[string]any
++			if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &m) != nil {
++				continue
++			}
++			if t, ok := m["type"].(string); ok {
++				types = append(types, t)
++			}
++		}
++	}
++	return types
++}
++
++func containsStr(ss []string, want string) bool {
++	for _, s := range ss {
++		if s == want {
++			return true
++		}
++	}
++	return false
++}
++
++func TestResponsesToChatInvalidJSON(t *testing.T) {
++	_, err := responsesToChat([]byte(`{`))
++	if err == nil {
++		t.Fatal("want error")
++	}
++	h := NewHandler(Config{Pool: pool.New(""), Upstream: &upstream.Client{}})
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses", bytes.NewReader([]byte(`{`))))
++	if rec.Code != http.StatusBadRequest {
++		t.Fatalf("code=%d", rec.Code)
++	}
++}
++
++// TestUsageCacheFields 上游的缓存命中数必须透出到两种格式的 usage（此前一律 0，
++// 客户端和面板都看不见缓存是否生效）。
++func TestUsageCacheFields(t *testing.T) {
++	up := map[string]any{
++		"prompt_tokens":             float64(100),
++		"completion_tokens":         float64(5),
++		"prompt_cache_hit_tokens":   float64(8960),
++		"prompt_cache_write_tokens": float64(0),
++		"prompt_tokens_details":     map[string]any{"cached_tokens": float64(8960)},
++	}
++	if got := anthropicUsage(up)["cache_read_input_tokens"]; got != float64(8960) {
++		t.Fatalf("anthropic cache_read_input_tokens=%v want 8960", got)
++	}
++	if got := anthropicUsage(nil)["cache_read_input_tokens"]; got != nil {
++		t.Fatalf("nil usage 不该凭空造缓存字段, got=%v", got)
++	}
++	d, _ := convertUsage(up)["input_tokens_details"].(map[string]any)
++	if d == nil || d["cached_tokens"] != float64(8960) {
++		t.Fatalf("responses input_tokens_details=%v want cached_tokens 8960", d)
++	}
++
++	chat, err := responsesToChat([]byte(`{"model":"m","prompt_cache_key":"sess-1","input":"hi"}`))
++	if err != nil {
++		t.Fatal(err)
++	}
++	var obj map[string]any
++	if err := json.Unmarshal(chat, &obj); err != nil {
++		t.Fatal(err)
++	}
++	if obj["prompt_cache_key"] != "sess-1" {
++		t.Fatalf("prompt_cache_key 未透传: %v", obj["prompt_cache_key"])
++	}
++}
++
++// commitTrackingWriter 模拟 net/http 的响应提交语义：Write/Flush 在未提交时
++// 隐式 WriteHeader(200)；提交后的重复 WriteHeader 计数（= 线上那条
++// "superfluous response.WriteHeader call" 警告的来源）。
++type commitTrackingWriter struct {
++	hdr         http.Header
++	body        bytes.Buffer
++	status      int
++	committed   bool
++	superfluous int
++}
++
++func newCommitTrackingWriter() *commitTrackingWriter {
++	return &commitTrackingWriter{hdr: http.Header{}}
++}
++
++func (c *commitTrackingWriter) Header() http.Header { return c.hdr }
++func (c *commitTrackingWriter) WriteHeader(code int) {
++	if c.committed {
++		c.superfluous++
++		return
++	}
++	c.committed, c.status = true, code
++}
++func (c *commitTrackingWriter) Write(p []byte) (int, error) {
++	if !c.committed {
++		c.WriteHeader(http.StatusOK)
++	}
++	return c.body.Write(p)
++}
++func (c *commitTrackingWriter) Flush() {
++	if !c.committed {
++		c.WriteHeader(http.StatusOK)
++	}
++}
++
++// TestResponsesEmitAfterFlushNoSuperfluousWriteHeader 流式路径先 Flush（上游逐帧
++// flush 已隐式提交 200）再 emit：不得出现第二次 WriteHeader（net/http 会打
++// superfluous 警告，线上实测噪音）。
++func TestResponsesEmitAfterFlushNoSuperfluousWriteHeader(t *testing.T) {
++	fw := newCommitTrackingWriter()
++	w := &responsesWriter{ResponseWriter: fw, stream: true}
++	w.Flush() // 模拟 StreamHint 在无输出帧后的 flush：提交 200
++	if err := w.emit("response.created", map[string]any{"response": map[string]any{"id": "resp_1"}}); err != nil {
++		t.Fatal(err)
++	}
++	if fw.superfluous != 0 {
++		t.Fatalf("emit 二次 WriteHeader 次数=%d want 0", fw.superfluous)
++	}
++	if fw.status != http.StatusOK {
++		t.Fatalf("status=%d want 200", fw.status)
++	}
++	if !strings.Contains(fw.body.String(), "event: response.created") {
++		t.Fatalf("body=%q", fw.body.String())
++	}
++}

@@ -16,6 +16,17 @@
   <img alt="Transport" src="https://img.shields.io/badge/Transport-SSE%20%2F%20Streaming-0DBD8B?style=flat-square">
 </p>
 
+> ### 📌 本仓库 = 上游 `v1.11.11` + Anthropic / Codex 入站兼容层
+>
+> 这是 fork 自 [`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel) 的**个人增强分支**，在 **tag `v1.11.11`** 基础上补上了上游以「入站协议保持单一」为由**关闭的 PR #63**：
+>
+> - `POST /v1/messages`、`POST /messages` —— **Anthropic Messages 协议**，Claude Code 可直接接入（`Bearer` 或 `x-api-key` 都认）
+> - `POST /v1/responses` —— **Codex Responses 协议**
+> - 修复面板「运行日志」/ `data/request-logs/*.jsonl` 对新端点的**归档盲区**
+>
+> 聊天主链路（选号 / 冷却 / 熔断 / 会话粘性 / 用量记账）**一行未动**，`/v1/chat/completions` 行为与上游完全一致。
+> 改动清单、客户端接入、构建部署、**升级上游时如何重放补丁**、已知限制 → 全部写在 **[ANTHROPIC-PORT.md](ANTHROPIC-PORT.md)**。下方 README 正文为上游原文。
+
 ---
 
 > **本项目是 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的增强分支**（fork）。
